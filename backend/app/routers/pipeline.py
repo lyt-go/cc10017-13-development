@@ -53,6 +53,12 @@ def apply_partition(table_name: str) -> ActionResult:
     return ActionResult(ok=True, message="分区策略已应用", entry=result)
 
 
+@router.get("/migration/{table_name}")
+def get_migration_chain(table_name: str) -> dict:
+    """查询分区迁移链：湖上分区定义→分区迁移计划→Iceberg目标元数据。"""
+    return pipeline_engine.migration_chain_status(table_name)
+
+
 @router.get("/quality/{topic_code}")
 def get_quality_chain(topic_code: str) -> dict:
     """查询质量容错链：水位→质量→死信。"""

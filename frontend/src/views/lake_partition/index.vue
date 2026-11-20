@@ -56,6 +56,97 @@
       </tbody>
     </table>
 
+    <section class="migration-section" data-testid="migration-section">
+      <header class="page-head">
+        <div>
+          <h3>分区迁移计划（小时 → 日）</h3>
+          <p class="page-desc">
+            支付表分区定义从小时粒度切换到日粒度的存量兼容方案：计划保留旧分区边界与目标分区规格，
+            旧小时分区与目标日分区一一对应；中断恢复后只续做未完成批次。
+          </p>
+        </div>
+        <div class="page-actions">
+          <select v-model="strategy" class="btn" data-testid="strategy-select" title="旧边界与目标日分区相遇时的冲突处置策略">
+            <option value="archive_boundary_first">先归档旧边界</option>
+            <option value="switch_metadata_first">先切换目标元数据</option>
+          </select>
+          <button class="btn primary" data-testid="generate-plan" type="button" @click="generatePlan">生成迁移计划</button>
+        </div>
+      </header>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>计划编号</th>
+            <th>目标表名</th>
+            <th>粒度切换</th>
+            <th>版本</th>
+            <th>冲突处置策略</th>
+            <th>批次进度</th>
+            <th>状态</th>
+            <th>最近原因</th>
+            <th>可执行动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="plan in plans" :key="plan.plan_id" :data-testid="`plan-${plan.plan_id}`" :data-status="plan.status">
+            <td>{{ plan.plan_id }}</td>
+            <td>{{ plan.table_name }}</td>
+            <td>{{ plan.source_granularity }} → {{ plan.target_granularity }}</td>
+            <td>v{{ plan.version }}</td>
+            <td>{{ plan.strategy_label }}</td>
+            <td>{{ plan.migrated_batches }}/{{ plan.total_batches }}</td>
+            <td>{{ plan.status }}</td>
+            <td>{{ plan.last_reason ?? '—' }}</td>
+            <td class="row-actions">
+              <button class="link" type="button" :data-testid="`execute-${plan.plan_id}`" @click="executePlan(plan)">执行下一批次</button>
+              <button class="link" type="button" :data-testid="`interrupt-${plan.plan_id}`" @click="interruptPlan(plan)">模拟中断</button>
+              <button class="link" type="button" :data-testid="`resume-${plan.plan_id}`" @click="resumePlan(plan)">
+                {{ plan.status === '失败' ? '重试' : '恢复迁移' }}
+              </button>
+              <button class="link" type="button" :data-testid="`detail-${plan.plan_id}`" @click="togglePlanDetail(plan)">映射明细</button>
+            </td>
+          </tr>
+          <tr v-if="!plans.length">
+            <td colspan="9" class="empty-state">暂无分区迁移计划记录，可先选择冲突处置策略后生成迁移计划</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div v-if="planDetail" class="plan-detail" data-testid="plan-detail">
+        <h4>
+          计划 {{ planDetail.plan_id }} 映射明细：旧小时分区 → 目标日分区一一对应
+          （{{ planDetail.source_spec }} → {{ planDetail.target_spec }}）
+        </h4>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>批次号</th>
+              <th>目标日分区</th>
+              <th>旧小时分区数</th>
+              <th>首个旧分区</th>
+              <th>末个旧分区</th>
+              <th>批次状态</th>
+              <th>冲突处置</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="batch in planDetail.batches" :key="batch.batch_no">
+              <td>{{ batch.batch_no }}</td>
+              <td>{{ batch.target_partition }}</td>
+              <td>{{ batch.source_partitions.length }}</td>
+              <td>{{ batch.source_partitions[0] }}</td>
+              <td>{{ batch.source_partitions[batch.source_partitions.length - 1] }}</td>
+              <td>{{ batch.status }}</td>
+              <td>{{ batch.resolution ?? '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p v-if="migrationMessage" class="info-text" data-testid="migration-message">{{ migrationMessage }}</p>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记分区定义</h3>
@@ -85,6 +176,31 @@ import { computed, onMounted, ref } from 'vue'
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
+type PlanBatch = {
+  batch_no: number
+  target_partition: string
+  source_partitions: string[]
+  status: string
+  resolution: string | null
+  migrated_at: string | null
+}
+type Plan = {
+  plan_id: string
+  table_name: string
+  source_granularity: string
+  target_granularity: string
+  source_spec: string
+  target_spec: string
+  version: number
+  strategy: string
+  strategy_label: string
+  status: string
+  migrated_batches: number
+  total_batches: number
+  mapping_count: number
+  last_reason: string | null
+  batches: PlanBatch[]
+}
 
 const ENDPOINT = '/api/lake_partition'
 const columns = ["分区编号", "目标表名", "分区列名", "分区粒度", "分区转换", "存储位置", "文件格式", "生命周期"]
@@ -105,6 +221,11 @@ const stats = computed(() => [
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
   { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
 ])
+
+const plans = ref<Plan[]>([])
+const planDetail = ref<Plan | null>(null)
+const strategy = ref('archive_boundary_first')
+const migrationMessage = ref('')
 
 function resetFilters() {
   filters.value = {}
@@ -159,12 +280,97 @@ async function runAction(action: string, row: Row) {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
-    if (!response.ok) {
-      throw new Error('湖上分区动作未生效，请稍后重试')
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || '湖上分区动作未生效，请稍后重试')
     }
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '湖上分区操作失败'
+  }
+}
+
+async function loadPlans() {
+  try {
+    const response = await request(`${ENDPOINT}/migration-plans`)
+    if (!response.ok) throw new Error('分区迁移计划列表读取失败')
+    const payload = await response.json()
+    plans.value = payload.items ?? []
+  } catch (error) {
+    migrationMessage.value = error instanceof Error ? error.message : '分区迁移计划列表读取失败'
+  }
+}
+
+async function generatePlan() {
+  migrationMessage.value = ''
+  const source = rows.value.find((row) => row['分区粒度'] === 'hour')
+  if (!source) {
+    migrationMessage.value = '没有处于 hour 粒度的分区定义，无法生成小时到日的迁移计划'
+    return
+  }
+  try {
+    const response = await request(`${ENDPOINT}/migration-plans`, {
+      method: 'POST',
+      body: JSON.stringify({ entry_id: source.id, strategy: strategy.value }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '生成迁移计划失败')
+    migrationMessage.value = payload.message
+    planDetail.value = null
+    await Promise.all([reload(), loadPlans()])
+  } catch (error) {
+    migrationMessage.value = error instanceof Error ? error.message : '生成迁移计划失败'
+  }
+}
+
+async function runPlanAction(plan: Plan, action: string, body: Record<string, unknown>) {
+  migrationMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/migration-plans/${plan.plan_id}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '迁移计划操作失败')
+    migrationMessage.value = payload.message
+    await Promise.all([reload(), loadPlans()])
+    if (planDetail.value?.plan_id === plan.plan_id) {
+      await refreshPlanDetail(plan.plan_id)
+    }
+  } catch (error) {
+    migrationMessage.value = error instanceof Error ? error.message : '迁移计划操作失败'
+  }
+}
+
+async function executePlan(plan: Plan) {
+  await runPlanAction(plan, 'execute', {})
+}
+
+async function interruptPlan(plan: Plan) {
+  await runPlanAction(plan, 'interrupt', { reason: '模拟中断：迁移窗口人工暂停，待恢复' })
+}
+
+async function resumePlan(plan: Plan) {
+  await runPlanAction(plan, 'resume', {})
+}
+
+async function refreshPlanDetail(planId: string) {
+  const response = await request(`${ENDPOINT}/migration-plans/${planId}`)
+  if (response.ok) {
+    planDetail.value = (await response.json()) as Plan
+  }
+}
+
+async function togglePlanDetail(plan: Plan) {
+  migrationMessage.value = ''
+  if (planDetail.value?.plan_id === plan.plan_id) {
+    planDetail.value = null
+    return
+  }
+  try {
+    await refreshPlanDetail(plan.plan_id)
+  } catch (error) {
+    migrationMessage.value = error instanceof Error ? error.message : '迁移计划明细读取失败'
   }
 }
 
@@ -184,5 +390,8 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+  void loadPlans()
+})
 </script>

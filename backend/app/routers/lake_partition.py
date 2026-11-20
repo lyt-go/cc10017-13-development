@@ -1,14 +1,19 @@
-"""湖上分区接口：维护分区定义，覆盖提交校验、标记生效、停用分区等动作。"""
+"""湖上分区接口：维护分区定义，覆盖提交校验、标记生效、停用分区等动作。
+
+增强：新增分区迁移计划接口——生成、执行、中断、恢复，计划是交给Iceberg管理的交接对象。
+"""
 from __future__ import annotations
 
 import csv
 import io
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.lake_partition import LakePartitionService
+from app.services.partition_migration import migration_service
 
 router = APIRouter(prefix="/api/lake_partition", tags=["湖上分区"])
 
@@ -65,6 +70,77 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="lake_partition.csv"'})
 
 
+# ───────────────────────────────
+# 分区迁移计划：必须声明在 /{entry_id} 之前，避免被整数路由吃掉
+# ───────────────────────────────
+
+@router.get("/migration-plans", response_model=PageResult[dict])
+def list_migration_plans(
+    table_name: str | None = Query(default=None, description="按目标表名过滤"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=200),
+) -> PageResult[dict]:
+    """分区迁移计划列表；空列表时前端展示暂无记录。"""
+    plans = migration_service.list_plans(table_name)
+    total = len(plans)
+    start = (page - 1) * size
+    return PageResult(items=plans[start:start + size], total=total, page=page, size=size)
+
+
+@router.post("/migration-plans", response_model=ActionResult)
+def generate_migration_plan(payload: dict[str, Any]) -> ActionResult:
+    """校验支付表分区定义并生成迁移计划：保留旧分区边界与目标分区规格，旧小时分区与目标日分区一一对应。"""
+    entry_id = payload.get("entry_id")
+    if not isinstance(entry_id, int):
+        return ActionResult(ok=False, message="缺少 entry_id，无法定位分区定义")
+    strategy = str(payload.get("strategy") or "archive_boundary_first")
+    plan, message = service.generate_migration_plan(entry_id, strategy)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=plan)
+
+
+@router.get("/migration-plans/{plan_id}", response_model=dict)
+def get_migration_plan(plan_id: str) -> dict:
+    """读取单条迁移计划明细（含批次与一一对应映射）；不存在时给出可读的错误说明。"""
+    plan = migration_service.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"分区迁移计划 {plan_id} 不存在")
+    return plan
+
+
+@router.post("/migration-plans/{plan_id}/execute", response_model=ActionResult)
+def execute_migration_plan(plan_id: str, payload: dict[str, Any] | None = None) -> ActionResult:
+    """按批次执行迁移；batch_limit 缺省为 1，即每次执行一个未完成批次。"""
+    body = payload or {}
+    raw_limit = body.get("batch_limit")
+    batch_limit = raw_limit if isinstance(raw_limit, int) and raw_limit > 0 else 1
+    plan, message = migration_service.execute_plan(plan_id, batch_limit=batch_limit)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=plan)
+
+
+@router.post("/migration-plans/{plan_id}/interrupt", response_model=ActionResult)
+def interrupt_migration_plan(plan_id: str, payload: dict[str, Any] | None = None) -> ActionResult:
+    """标记中断并说明原因；已迁移范围保留，恢复后只续做未完成批次。"""
+    reason = (payload or {}).get("reason")
+    plan, message = migration_service.interrupt_plan(plan_id, reason)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=plan)
+
+
+@router.post("/migration-plans/{plan_id}/resume", response_model=ActionResult)
+def resume_migration_plan(plan_id: str, payload: dict[str, Any] | None = None) -> ActionResult:
+    """中断或失败后重试：只续做未完成批次，返回消息说明恢复原因。"""
+    reason = (payload or {}).get("reason")
+    plan, message = migration_service.resume_plan(plan_id, reason)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=plan)
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条分区定义明细；不存在时给出可读的错误说明。"""
@@ -76,10 +152,10 @@ def get_entry(entry_id: int) -> dict:
 
 @router.post("", response_model=ActionResult)
 def create_entry(payload: dict[str, object]) -> ActionResult:
-    """登记一条分区定义，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    """登记一条分区定义，缺字段或校验未通过时说明原因而不是静默丢弃。"""
+    entry, errors = service.create_entry(payload)
+    if errors:
+        return ActionResult(ok=False, message="；".join(errors))
     return ActionResult(ok=True, message="分区定义已登记", entry=entry)
 
 

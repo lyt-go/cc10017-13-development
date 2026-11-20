@@ -14,6 +14,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
+from app.services.partition_migration import migration_service
 from app.store import store
 
 
@@ -161,11 +162,34 @@ class PipelineEngine:
         }
 
     def apply_partition_to_iceberg(self, table_name: str) -> dict[str, Any]:
-        """将分区策略应用到Iceberg表：跨模块数据产物。"""
+        """将分区策略应用到Iceberg表：跨模块数据产物。
+
+        若该表存在已完成的分区迁移计划，则以计划为交接对象写入目标分区规格，
+        保证Iceberg元数据与湖上分区迁移结果一致。
+        """
         partition = self._find_by_field("lake_partition", "目标表名", table_name)
         iceberg = self._find_by_field("iceberg_table", "表名称", table_name)
         if not partition or not iceberg:
             return {"ok": False, "error": "分区定义或Iceberg表缺失"}
+
+        plan = migration_service.latest_plan_for_table(table_name)
+        self._ensure_artifact_table("iceberg_partition_specs")
+        if plan and plan.get("status") == "已完成":
+            partition_spec = {
+                "table_name": table_name,
+                "partition_column": plan.get("partition_column"),
+                "granularity": plan.get("target_granularity"),
+                "source_spec": plan.get("source_spec"),
+                "target_spec": plan.get("target_spec"),
+                "plan_id": plan.get("plan_id"),
+                "plan_version": plan.get("version"),
+                "format": partition.get("文件格式"),
+                "iceberg_metadata_version": iceberg.get("元数据版本"),
+                "applied_at": datetime.now().isoformat(),
+                "source": "partition_migration_plan",
+            }
+            store.rows("iceberg_partition_specs").append(partition_spec)
+            return {"ok": True, "spec": partition_spec}
 
         # 生成分区元数据产物
         partition_spec = {
@@ -176,10 +200,45 @@ class PipelineEngine:
             "iceberg_metadata_version": iceberg.get("元数据版本"),
             "applied_at": datetime.now().isoformat(),
         }
-        self._ensure_artifact_table("iceberg_partition_specs")
         store.rows("iceberg_partition_specs").append(partition_spec)
 
         return {"ok": True, "spec": partition_spec}
+
+    def migration_chain_status(self, table_name: str) -> dict[str, Any]:
+        """查询分区迁移链：湖上分区定义 → 分区迁移计划 → Iceberg目标元数据。"""
+        partition = self._find_by_field("lake_partition", "目标表名", table_name)
+        plan = migration_service.latest_plan_for_table(table_name)
+        iceberg = self._find_by_field("iceberg_table", "表名称", table_name)
+        verify = (iceberg or {}).get("_migration_verify") or {}
+        verified = bool(plan) and verify.get("plan_id") == plan.get("plan_id")
+
+        return {
+            "lake_partition": {
+                "exists": partition is not None,
+                "status": partition.get("status") if partition else None,
+                "granularity": partition.get("分区粒度") if partition else None,
+                "entry": partition,
+            },
+            "migration_plan": {
+                "exists": plan is not None,
+                "status": plan.get("status") if plan else None,
+                "version": plan.get("version") if plan else None,
+                "progress": f"{plan.get('migrated_batches')}/{plan.get('total_batches')}" if plan else None,
+                "entry": plan,
+            },
+            "iceberg_table": {
+                "exists": iceberg is not None,
+                "status": iceberg.get("status") if iceberg else None,
+                "metadata_version": iceberg.get("元数据版本") if iceberg else None,
+                "verified": verified,
+                "entry": iceberg,
+            },
+            "chain_ready": all([
+                partition is not None,
+                plan is not None and plan.get("status") == "已完成",
+                verified,
+            ]),
+        }
 
     # ───────────────────────────────
     # 质量容错链
@@ -580,6 +639,7 @@ class PipelineEngine:
         artifacts = {
             "upsert_merge_artifacts": len(store.rows("upsert_merge_artifacts")),
             "iceberg_partition_specs": len(store.rows("iceberg_partition_specs")),
+            "partition_migration_plans": len(store.rows("partition_migration_plans")),
             "quality_inspection_results": len(store.rows("quality_inspection_results")),
             "materialized_refresh_log": len(store.rows("materialized_refresh_log")),
             "sink_dispatch_queue": len(store.rows("sink_dispatch_queue")),

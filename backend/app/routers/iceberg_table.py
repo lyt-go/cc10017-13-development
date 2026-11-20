@@ -74,6 +74,24 @@ def get_entry(entry_id: int) -> dict:
     return entry
 
 
+@router.get("/{entry_id}/migration-plans", response_model=PageResult[dict])
+def list_related_migration_plans(entry_id: int) -> PageResult[dict]:
+    """表关联的分区迁移计划：与湖上分区读取同一份交接对象，保证两边展示一致。"""
+    plans = service.list_migration_plans(entry_id)
+    if plans is None:
+        raise HTTPException(status_code=404, detail=f"表元数据 {entry_id} 不存在或已归档")
+    return PageResult(items=plans, total=len(plans), page=1, size=len(plans) or 1)
+
+
+@router.post("/{entry_id}/verify-migration", response_model=ActionResult)
+def verify_migration(entry_id: int) -> ActionResult:
+    """核对最新分区迁移计划并写入支付表目标分区元数据；计划未完成或落区冲突时说明原因。"""
+    entry, message = service.verify_target_metadata(entry_id)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
+
+
 @router.post("", response_model=ActionResult)
 def create_entry(payload: dict[str, object]) -> ActionResult:
     """登记一条表元数据，缺字段时说明原因而不是静默丢弃。"""
